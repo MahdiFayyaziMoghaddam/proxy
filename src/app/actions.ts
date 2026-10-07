@@ -4,50 +4,65 @@ export async function request(data: FormData) {
 	const url = data.get("url");
 	const urlRegex = /^(https?:\/\/)?([\w-]+\.)+[\w-]+(\/[\w\-./?%&=]*)?$/;
 
-	if (typeof url === "string" && urlRegex.test(url)) {
-		const baseUrl = url.startsWith("http") ? url : `https://${url}`;
-		try {
-			const res = await fetch(baseUrl);
-			let html = await res.text();
-			const scriptsUrls = [
-				...new Set(
-					[...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) =>
-						m[1].startsWith("http") ? m[1] : baseUrl + m[1]
-					)
-				)
-			];
-			const links = [
-				...new Set(
-					[...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]+href=["']([^"']+)["']/gi)].map((m) =>
-						m[1].startsWith("http") ? m[1] : baseUrl + m[1]
-					)
-				)
-			];
+	if (typeof url !== "string" || !urlRegex.test(url)) {
+		return "Invalid URL";
+	}
 
-			html = html.replace(/<script[^>]+src=["'][^"']+["'][^>]*>\s*<\/script>/gi, "");
-			html = html.replace(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi, "");
+	const baseUrl = url.startsWith("http") ? url : `https://${url}`;
 
-			html = html.replace(/(href|src)=["'](?!https?:\/\/|\/\/|data:)([^"']+)["']/gi, (_, attr, path) => {
+	try {
+		const res = await fetch(baseUrl, {
+			headers: {
+				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+			}
+		});
+
+		let html = await res.text();
+
+		// Extract script srcs
+		const scriptUrls = [
+			...new Set(
+				[...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) =>
+					m[1].startsWith("http") ? m[1] : new URL(m[1], baseUrl).href
+				)
+			)
+		];
+
+		// Extract stylesheet hrefs
+		const linkUrls = [
+			...new Set(
+				[...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*href=["']([^"']+)["']/gi)].map((m) =>
+					m[1].startsWith("http") ? m[1] : new URL(m[1], baseUrl).href
+				)
+			)
+		];
+
+		// Extract head parts
+		const headParts = [
+			...(html.match(/<title[^>]*>[\s\S]*?<\/title>/gi) || []),
+			...(html.match(/<meta[^>]*>/gi) || [])
+		].join("\n");
+
+		// Clean html
+		html = html
+			.replace(/<script[^>]+src=["'][^"']+["'][^>]*>\s*<\/script>/gi, "")
+			.replace(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi, "")
+			.replace(/<title[^>]*>[\s\S]*?<\/title>/gi, "")
+			.replace(/<meta[^>]*>/gi, "");
+
+		// Make relative urls absolute
+		html = html.replace(/(href|src)=["'](?!https?:\/\/|\/\/|data:|#)([^"']+)["']/gi, (_, attr, path) => {
+			try {
 				return `${attr}="${new URL(path, baseUrl).href}"`;
-			});
+			} catch {
+				return `${attr}="${path}"`;
+			}
+		});
 
-			// Extract head parts (title, meta, link)
-			const head = [
-				...(html.match(/<title[^>]*>[\s\S]*?<\/title>/gi) || []),
-				...(html.match(/<meta[^>]*>/gi) || []),
-				...(html.match(/<link[^>]*>/gi) || [])
-			].join("\n");
-
-			// Remove head parts from html
-			html = html.replace(/<title[^>]*>[\s\S]*?<\/title>/gi, "");
-			html = html.replace(/<meta[^>]*>/gi, "");
-			html = html.replace(/<link[^>]*>/gi, "");
-
-			// Remove script tags
-			html = html.replace(/<script[^>]+src=["'][^"']+["'][^>]*>\s*<\/script>/gi, "");
-
-			const styles = await Promise.all(
-				links.map(async (href) => {
+		// Fetch CSS
+		const styles = (
+			await Promise.all(
+				linkUrls.map(async (href) => {
 					try {
 						const r = await fetch(href);
 						return await r.text();
@@ -55,10 +70,13 @@ export async function request(data: FormData) {
 						return "";
 					}
 				})
-			);
+			)
+		).filter(Boolean);
 
-			const scripts = await Promise.all(
-				scriptsUrls.map(async (src) => {
+		// Fetch JS
+		const scripts = (
+			await Promise.all(
+				scriptUrls.map(async (src) => {
 					try {
 						const r = await fetch(src);
 						return await r.text();
@@ -66,18 +84,16 @@ export async function request(data: FormData) {
 						return "";
 					}
 				})
-			);
+			)
+		).filter(Boolean);
 
-			return {
-				body: html,
-				styles: styles.filter(Boolean), // only successful ones
-				scripts: scripts.filter(Boolean),
-				head
-			};
-		} catch (e) {
-			return "Invalid URL";
-		}
-	} else {
-		return "Invalid URL";
+		return {
+			head: headParts,
+			body: html,
+			styles,
+			scripts
+		};
+	} catch (e) {
+		return "Failed to fetch";
 	}
 }

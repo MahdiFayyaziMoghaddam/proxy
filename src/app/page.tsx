@@ -1,22 +1,56 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { request } from "./actions";
 
 export default function Home() {
-	const [data, setData] = useState<string>("");
-	const rootRef = useRef<HTMLHtmlElement>(null);
 	useEffect(() => {
-		const url = prompt("Enter Target URL:") || "";
-		const formData = new FormData();
-		formData.append("url", url);
-		request(formData).then((d) => {
-			if (typeof d !== "object") return;
-			document.body.innerHTML = `${d.body} ${d.scripts.length > 0 ? `<script>${d.scripts.join(" ")}</script>` : ""}`;
-			document.head.innerHTML = `${d.head} ${d.styles.length > 0 ? `<style>${d.styles.join(" ")}</style>` : ""}`;
+		const load = async (url: string) => {
+			const formData = new FormData();
+			formData.append("url", url);
 
-			// document.head?.insertAdjacentHTML("afterbegin", d.styles.join(" "));
-		});
+			const result = await request(formData);
+			if (typeof result === "string") {
+				alert(result);
+				return;
+			}
+
+			// Clear and inject head
+			document.head.innerHTML = "";
+			document.head.insertAdjacentHTML("afterbegin", result.head);
+
+			if (result.styles.length) {
+				const style = document.createElement("style");
+				style.textContent = result.styles.join("\n");
+				document.head.appendChild(style);
+			}
+
+			// Inject body
+			document.body.innerHTML = result.body;
+
+			// Inject scripts
+			result.scripts.forEach((code) => {
+				const script = document.createElement("script");
+				script.textContent = code;
+				document.body.appendChild(script);
+			});
+
+			// Handle all <a> clicks
+			document.addEventListener("click", async (e) => {
+				const a = (e.target as HTMLElement).closest("a");
+				if (!a) return;
+
+				e.preventDefault();
+				const href = a.href;
+				if (!href || href.startsWith("javascript:")) return;
+
+				await load(href);
+			});
+		};
+
+		const target = prompt("Enter Target URL:");
+		if (target) load(target);
 	}, []);
-	return <></>;
+
+	return null;
 }
