@@ -1,186 +1,204 @@
 "use server";
 
-const FAKE_HEADERS = {
-	"User-Agent":
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-	Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-	"Accept-Language": "en-US,en;q=0.9",
-	"Accept-Encoding": "gzip, deflate, br",
-	"Cache-Control": "no-cache",
-	Pragma: "no-cache",
-	"Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-	"Sec-Ch-Ua-Mobile": "?0",
-	"Sec-Ch-Ua-Platform": '"Windows"',
-	"Sec-Fetch-Dest": "document",
-	"Sec-Fetch-Mode": "navigate",
-	"Sec-Fetch-Site": "none",
-	"Sec-Fetch-User": "?1",
-	"Upgrade-Insecure-Requests": "1"
-};
+const UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
-function isValidUrl(url: string) {
+const STRIP_REQ = new Set([
+	"host",
+	"origin",
+	"referer",
+	"content-length",
+	"connection",
+	"accept-encoding",
+	"cookie",
+	"sec-fetch-dest",
+	"sec-fetch-mode",
+	"sec-fetch-site",
+	"sec-fetch-user"
+]);
+
+const STRIP_RES = new Set([
+	"content-encoding",
+	"content-length",
+	"transfer-encoding",
+	"connection",
+	"set-cookie",
+	"content-security-policy",
+	"content-security-policy-report-only",
+	"x-frame-options"
+]);
+
+function parse(url: string): URL | null {
 	try {
-		new URL(url.startsWith("http") ? url : `https://${url}`);
-		return true;
+		return new URL(url.startsWith("http") ? url : `https://${url}`);
 	} catch {
+		return null;
+	}
+}
+
+// crude SSRF guard — good enough for a toy
+function isSafe(u: URL): boolean {
+	if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+	const h = u.hostname.toLowerCase();
+	if (h === "localhost" || h.endsWith(".local") || h.endsWith(".internal")) return false;
+	if (
+		/^(10\.|127\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) ||
+		h === "::1" ||
+		h.startsWith("fc") ||
+		h.startsWith("fd") ||
+		h.startsWith("fe80")
+	) {
 		return false;
 	}
+	return true;
 }
 
-function abs(url: string, base: string) {
+// turn an absolute URL into /__asset/<proto>/<host>/<path...>
+function toAssetUrl(absUrl: string): string {
+	const u = new URL(absUrl);
+	const proto = u.protocol.replace(":", "");
+	const path = u.pathname.replace(/^\/+/, "");
+	const q = u.search ? u.search : "";
+	return `/__asset/${proto}/${u.host}/${path}${q}`;
+}
+
+// turn a relative path into an absolute URL, guarded
+function abs(path: string, base: string): string {
 	try {
-		return new URL(url, base).href;
+		return new URL(path, base).href;
 	} catch {
-		return url;
+		return path;
 	}
 }
 
-// ---------- initial page load ----------
-export async function request(data: FormData) {
-	const raw = data.get("url");
-	if (typeof raw !== "string" || !isValidUrl(raw)) return "Invalid URL";
+// ============================================================
+// initial page load
+// ============================================================
+export async function request(rawUrl: string) {
+	const u = parse(rawUrl);
+	if (!u || !isSafe(u)) return "Invalid URL";
 
-	const baseUrl = raw.startsWith("http") ? raw : `https://${raw}`;
-
+	let res: Response;
 	try {
-		const res = await fetch(baseUrl, {
-			headers: FAKE_HEADERS,
+		res = await fetch(u, {
+			headers: { "user-agent": UA },
 			redirect: "follow"
 		});
-
-		let html = await res.text();
-
-		// collect external assets
-		const scriptUrls = [
-			...new Set([...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => abs(m[1], baseUrl)))
-		].filter(Boolean) as string[];
-
-		const linkUrls = [
-			...new Set(
-				[...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*href=["']([^"']+)["']/gi)].map((m) =>
-					abs(m[1], baseUrl)
-				)
-			)
-		].filter(Boolean) as string[];
-
-		const headParts = [
-			...(html.match(/<title[^>]*>[\s\S]*?<\/title>/gi) || []),
-			...(html.match(/<meta[^>]*>/gi) || [])
-		].join("\n");
-
-		// strip external scripts + styles from html
-		html = html
-			.replace(/<script[^>]+src=["'][^"']+["'][^>]*>\s*<\/script>/gi, "")
-			.replace(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi, "")
-			.replace(/<title[^>]*>[\s\S]*?<\/title>/gi, "")
-			.replace(/<meta[^>]*>/gi, "");
-
-		// make remaining relative urls absolute
-		html = html.replace(
-			/(href|src|srcset)=["'](?!https?:\/\/|\/\/|data:|#|javascript:)([^"']+)["']/gi,
-			(_, attr, path) => {
-				try {
-					if (attr === "srcset") {
-						const parts = path.split(",").map((p: string) => {
-							const [u, size] = p.trim().split(/\s+/);
-							return `${abs(u, baseUrl)}${size ? " " + size : ""}`;
-						});
-						return `srcset="${parts.join(", ")}"`;
-					}
-					return `${attr}="${abs(path, baseUrl)}"`;
-				} catch {
-					return `${attr}="${path}"`;
-				}
-			}
-		);
-
-		// fetch css + js
-		const [styles, scripts] = await Promise.all([
-			Promise.all(
-				linkUrls.map(async (href) => {
-					try {
-						const r = await fetch(href, { headers: FAKE_HEADERS });
-						return await r.text();
-					} catch {
-						return "";
-					}
-				})
-			),
-			Promise.all(
-				scriptUrls.map(async (src) => {
-					try {
-						const r = await fetch(src, { headers: FAKE_HEADERS });
-						return await r.text();
-					} catch {
-						return "";
-					}
-				})
-			)
-		]);
-
-		return {
-			head: headParts,
-			body: html,
-			styles: styles.filter(Boolean),
-			scripts: scripts.filter(Boolean),
-			baseUrl
-		};
 	} catch {
 		return "Failed to fetch";
 	}
+
+	const base = res.url || u.href;
+	let html = await res.text();
+
+	// ---- extract external assets ----
+	const scriptUrls = [...new Set([...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map((m) => abs(m[1], base)))];
+
+	const styleUrls = [
+		...new Set(
+			[...html.matchAll(/<link[^>]+rel=["']stylesheet["'][^>]*href=["']([^"']+)["']/gi)].map((m) => abs(m[1], base))
+		)
+	];
+
+	// ---- extract head bits ----
+	const head = [...(html.match(/<title[^>]*>[\s\S]*?<\/title>/gi) ?? []), ...(html.match(/<meta[^>]*>/gi) ?? [])].join(
+		"\n"
+	);
+
+	// ---- strip what we hoisted ----
+	html = html
+		.replace(/<script[^>]+src=["'][^"']+["'][^>]*>\s*<\/script>/gi, "")
+		.replace(/<link[^>]+rel=["']stylesheet["'][^>]*>/gi, "")
+		.replace(/<title[^>]*>[\s\S]*?<\/title>/gi, "")
+		.replace(/<meta[^>]*>/gi, "");
+
+	// ---- rewrite remaining relative urls ----
+	html = html.replace(
+		/(href|src|srcset|action|poster|data-src)=["'](?!https?:\/\/|\/\/|data:|#|javascript:)([^"']+)["']/gi,
+		(_, attr: string, value: string) => {
+			try {
+				if (attr.toLowerCase() === "srcset") {
+					const out = value
+						.split(",")
+						.map((part) => {
+							const [p, size] = part.trim().split(/\s+/);
+							return `${abs(p, base)}${size ? " " + size : ""}`;
+						})
+						.join(", ");
+					return `srcset="${out}"`;
+				}
+				return `${attr}="${abs(value, base)}"`;
+			} catch {
+				return `${attr}="${value}"`;
+			}
+		}
+	);
+
+	// ---- fetch + rewrite CSS ----
+	const styles = (
+		await Promise.all(
+			styleUrls.map(async (href) => {
+				try {
+					const css = await (await fetch(href, { headers: { "user-agent": UA } })).text();
+					// rewrite url(...) refs to absolute
+					return css.replace(
+						/url\(\s*(['"]?)(?!data:|https?:|\/\/)([^)'"]+)\1\s*\)/g,
+						(_, q: string, p: string) => `url(${q}${abs(p, href)}${q})`
+					);
+				} catch {
+					return "";
+				}
+			})
+		)
+	)
+		.filter(Boolean)
+		.join("\n");
+
+	// ---- ship script URLs already routed through /__asset ----
+	const proxiedScripts = scriptUrls.map(toAssetUrl);
+
+	return { head, body: html, styles, scriptUrls: proxiedScripts, baseUrl: base };
 }
 
-// ---------- generic proxy for fetch / xhr ----------
-export async function proxyRequest(data: FormData) {
-	const url = data.get("url") as string;
-	const method = (data.get("method") as string) || "GET";
-	const headersJson = data.get("headers") as string;
-	const body = data.get("body") as string | null;
-
-	if (!url || !isValidUrl(url)) {
+// ============================================================
+// generic fetch / xhr proxy
+// ============================================================
+export async function proxyRequest(input: {
+	url: string;
+	method?: string;
+	headers?: Record<string, string>;
+	body?: string;
+}) {
+	const u = parse(input.url);
+	if (!u || !isSafe(u)) {
 		return { status: 400, headers: {}, body: "Invalid URL" };
 	}
 
-	let headers: Record<string, string> = { ...FAKE_HEADERS };
-	try {
-		if (headersJson) {
-			const extra = JSON.parse(headersJson);
-			headers = { ...headers, ...extra };
-		}
-	} catch {}
+	const headers: Record<string, string> = { "user-agent": UA };
+	for (const [k, v] of Object.entries(input.headers ?? {})) {
+		const lk = k.toLowerCase();
+		if (!STRIP_REQ.has(lk)) headers[lk] = v;
+	}
 
-	// never forward host / origin / referer from client
-	delete headers["host"];
-	delete headers["origin"];
-	delete headers["referer"];
+	const method = (input.method ?? "GET").toUpperCase();
+	const hasBody = !["GET", "HEAD"].includes(method);
 
 	try {
-		const res = await fetch(url, {
+		const res = await fetch(u, {
 			method,
 			headers,
-			body: body && method !== "GET" && method !== "HEAD" ? body : undefined,
+			body: hasBody ? input.body : undefined,
 			redirect: "follow"
 		});
 
-		const text = await res.text();
+		const body = await res.text();
 		const resHeaders: Record<string, string> = {};
 		res.headers.forEach((v, k) => {
-			// skip hop-by-hop
-			if (!["content-encoding", "transfer-encoding", "connection"].includes(k.toLowerCase())) {
-				resHeaders[k] = v;
-			}
+			if (!STRIP_RES.has(k.toLowerCase())) resHeaders[k] = v;
 		});
 
-		return {
-			status: res.status,
-			headers: resHeaders,
-			body: text
-		};
-	} catch (e) {
-		return {
-			status: 502,
-			headers: {},
-			body: "Proxy failed"
-		};
+		return { status: res.status, headers: resHeaders, body, finalUrl: res.url };
+	} catch {
+		return { status: 502, headers: {}, body: "Proxy failed", finalUrl: input.url };
 	}
 }
