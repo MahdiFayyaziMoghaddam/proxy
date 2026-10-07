@@ -10,48 +10,43 @@ export default function Home() {
 			formData.append("url", url);
 
 			const result = await request(formData);
-
-			if ("error" in result) {
-				alert(result.error);
+			if (typeof result === "string") {
+				alert(result);
 				return;
 			}
 
-			const { head, body, styles, scripts, baseUrl } = result;
-
-			// 1. Clear & inject head
+			// clear + inject head
 			document.head.innerHTML = "";
-			document.head.insertAdjacentHTML("afterbegin", head);
+			document.head.insertAdjacentHTML("afterbegin", result.head || "");
 
-			if (styles.length) {
+			if (result.styles!.length) {
 				const style = document.createElement("style");
-				style.textContent = styles.join("\n");
+				style.textContent = result.styles!.join("\n");
 				document.head.appendChild(style);
 			}
 
-			// 2. CRITICAL: install interceptors BEFORE any third-party scripts run
-			installInterceptors(baseUrl);
+			// ---------- interceptors (must be before any third-party scripts) ----------
+			installInterceptors();
 
-			// 3. Inject body
-			document.body.innerHTML = body;
+			// inject body
+			document.body.innerHTML = result.body || "";
 
-			// 4. Inject the collected scripts (they now go through the interceptors)
-			scripts.forEach((code) => {
-				const script = document.createElement("script");
-				script.textContent = code;
-				document.body.appendChild(script);
+			// inject the collected scripts
+			result.scripts!.forEach((code) => {
+				const s = document.createElement("script");
+				s.textContent = code;
+				document.body.appendChild(s);
 			});
 
-			// 5. Handle <a> clicks (SPA-style navigation)
+			// link clicks
 			document.addEventListener(
 				"click",
 				async (e) => {
 					const a = (e.target as HTMLElement).closest("a");
 					if (!a) return;
-
 					e.preventDefault();
 					const href = a.href;
-					if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
-
+					if (!href || href.startsWith("javascript:")) return;
 					await load(href);
 				},
 				true
@@ -65,67 +60,53 @@ export default function Home() {
 	return null;
 }
 
-/** Install fetch + XHR + dynamic element interceptors */
-function installInterceptors(baseUrl: string) {
-	// ---------- fetch ----------
-	const originalFetch = window.fetch.bind(window);
-
-	window.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+// ============================================================
+// simple fetch + xhr middleware
+// ============================================================
+function installInterceptors() {
+	// ---- fetch ----
+	const originalFetch = window.fetch;
+	window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-
-		// allow same-origin or already-proxied requests to pass through if needed
-		if (url.startsWith("data:") || url.startsWith("blob:")) {
-			return originalFetch(input, init);
-		}
-
-		const form = new FormData();
-		form.append("url", url);
-		form.append("method", init?.method || "GET");
+		const method = init?.method || "GET";
+		const headers: Record<string, string> = {};
 
 		if (init?.headers) {
-			const h: Record<string, string> = {};
 			if (init.headers instanceof Headers) {
-				init.headers.forEach((v, k) => (h[k] = v));
+				init.headers.forEach((v, k) => (headers[k] = v));
 			} else if (Array.isArray(init.headers)) {
-				init.headers.forEach(([k, v]) => (h[k] = v));
+				init.headers.forEach(([k, v]) => (headers[k] = v));
 			} else {
-				Object.assign(h, init.headers);
+				Object.assign(headers, init.headers);
 			}
-			form.append("headers", JSON.stringify(h));
 		}
 
+		let body: string | null = null;
 		if (init?.body) {
-			if (typeof init.body === "string") {
-				form.append("body", init.body);
-			} else if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
-				form.append("body", btoa(String.fromCharCode(...new Uint8Array(init.body as ArrayBuffer))));
-				form.append("isBase64", "1");
-			} else if (init.body instanceof Blob) {
-				const buf = await init.body.arrayBuffer();
-				form.append("body", btoa(String.fromCharCode(...new Uint8Array(buf))));
-				form.append("isBase64", "1");
+			if (typeof init.body === "string") body = init.body;
+			else if (init.body instanceof FormData) {
+				// simple FormData → just skip or stringify later if needed
+				body = null;
 			} else {
-				// FormData / URLSearchParams → let the browser serialize
-				form.append("body", String(init.body));
+				body = String(init.body);
 			}
 		}
 
-		const proxied = await proxyRequest(form);
+		const fd = new FormData();
+		fd.append("url", url);
+		fd.append("method", method);
+		fd.append("headers", JSON.stringify(headers));
+		if (body) fd.append("body", body);
 
-		if ("error" in proxied) {
-			throw new Error(proxied.error);
-		}
+		const proxied = await proxyRequest(fd);
 
-		const body = proxied.isBase64 ? Uint8Array.from(atob(proxied.body), (c) => c.charCodeAt(0)) : proxied.body;
-
-		return new Response(body, {
+		return new Response(proxied.body, {
 			status: proxied.status,
-			statusText: proxied.statusText,
 			headers: proxied.headers
 		});
 	};
 
-	// ---------- XMLHttpRequest ----------
+	// ---- XMLHttpRequest ----
 	const OriginalXHR = window.XMLHttpRequest;
 
 	class ProxiedXHR extends OriginalXHR {
@@ -134,131 +115,41 @@ function installInterceptors(baseUrl: string) {
 		private _headers: Record<string, string> = {};
 		private _body: any = null;
 
-		open(method: string, url: string | URL, async: boolean = true, username?: string | null, password?: string | null) {
+		open(method: string, url: string | URL, async?: boolean, user?: string | null, password?: string | null) {
 			this._method = method;
 			this._url = typeof url === "string" ? url : url.href;
-			// we still call super so readyState changes work, but we will never actually send to the real network
-			super.open(method, url, async, username, password);
+			// call original with a dummy so the object is ready
+			super.open(method, "about:blank", async !== false, user, password);
 		}
 
 		setRequestHeader(name: string, value: string) {
 			this._headers[name] = value;
-			// do not call super – we don't want the real request
 		}
 
 		send(body?: Document | XMLHttpRequestBodyInit | null) {
 			this._body = body;
 
-			const form = new FormData();
-			form.append("url", this._url);
-			form.append("method", this._method);
-			form.append("headers", JSON.stringify(this._headers));
+			const fd = new FormData();
+			fd.append("url", this._url);
+			fd.append("method", this._method);
+			fd.append("headers", JSON.stringify(this._headers));
+			if (body && typeof body === "string") fd.append("body", body);
 
-			if (body) {
-				if (typeof body === "string") {
-					form.append("body", body);
-				} else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-					form.append("body", btoa(String.fromCharCode(...new Uint8Array(body as ArrayBuffer))));
-					form.append("isBase64", "1");
-				} else if (body instanceof Blob) {
-					body.arrayBuffer().then((buf) => {
-						form.append("body", btoa(String.fromCharCode(...new Uint8Array(buf))));
-						form.append("isBase64", "1");
-						this._doProxy(form);
-					});
-					return;
-				} else {
-					form.append("body", String(body));
-				}
-			}
-
-			this._doProxy(form);
-		}
-
-		private async _doProxy(form: FormData) {
-			try {
-				const proxied = await proxyRequest(form);
-
-				if ("error" in proxied) {
-					this.dispatchEvent(new Event("error"));
-					return;
-				}
-
-				// Fake the response
-				Object.defineProperty(this, "status", { value: proxied.status });
-				Object.defineProperty(this, "statusText", { value: proxied.statusText });
-				Object.defineProperty(this, "responseText", {
-					value: proxied.isBase64 ? atob(proxied.body) : proxied.body
-				});
-				Object.defineProperty(this, "response", {
-					value: proxied.isBase64 ? Uint8Array.from(atob(proxied.body), (c) => c.charCodeAt(0)) : proxied.body
-				});
+			proxyRequest(fd).then((res) => {
+				// fake the response
+				Object.defineProperty(this, "status", { value: res.status });
+				Object.defineProperty(this, "statusText", { value: "" });
+				Object.defineProperty(this, "responseText", { value: res.body });
+				Object.defineProperty(this, "response", { value: res.body });
 				Object.defineProperty(this, "readyState", { value: 4 });
 
-				// headers
-				const headerStr = Object.entries(proxied.headers)
-					.map(([k, v]) => `${k}: ${v}`)
-					.join("\r\n");
-				Object.defineProperty(this, "getAllResponseHeaders", {
-					value: () => headerStr
-				});
-				Object.defineProperty(this, "getResponseHeader", {
-					value: (name: string) => proxied.headers[name.toLowerCase()] || null
-				});
-
+				// fire events
 				this.dispatchEvent(new Event("readystatechange"));
 				this.dispatchEvent(new Event("load"));
 				this.dispatchEvent(new Event("loadend"));
-			} catch (err) {
-				this.dispatchEvent(new Event("error"));
-			}
+			});
 		}
 	}
 
-	window.XMLHttpRequest = ProxiedXHR as any;
-
-	// ---------- Dynamic script / link creation ----------
-	const originalCreateElement = document.createElement.bind(document);
-
-	document.createElement = function <K extends keyof HTMLElementTagNameMap>(
-		tagName: K,
-		options?: ElementCreationOptions
-	): HTMLElementTagNameMap[K] {
-		const el = originalCreateElement(tagName, options);
-
-		if (tagName.toLowerCase() === "script") {
-			const script = el as HTMLScriptElement;
-			const originalSrcSetter = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src")?.set;
-
-			Object.defineProperty(script, "src", {
-				set(value: string) {
-					// force the script to be loaded via our proxy by converting it to an inline script later
-					// for simplicity we still set the real src but the browser will load it through fetch interceptor
-					// (because we already overrode fetch). This is good enough for most cases.
-					originalSrcSetter?.call(script, value);
-				},
-				get() {
-					return script.getAttribute("src") || "";
-				},
-				configurable: true
-			});
-		}
-
-		if (tagName.toLowerCase() === "link") {
-			const link = el as HTMLLinkElement;
-			const originalHrefSetter = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, "href")?.set;
-
-			Object.defineProperty(link, "href", {
-				set(value: string) {
-					originalHrefSetter?.call(link, value);
-				},
-				get() {
-					return link.getAttribute("href") || "";
-				},
-				configurable: true
-			});
-		}
-
-		return el;
-	};
+	(window as any).XMLHttpRequest = ProxiedXHR;
 }
